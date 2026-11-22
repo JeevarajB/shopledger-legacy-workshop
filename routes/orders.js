@@ -69,6 +69,18 @@ router.post('/orders', function (req, res) {
   }
 
   var totals = pricing.computeTotals(items, rawCoupon);
+  for (var lineIndex = 0; lineIndex < items.length; lineIndex++) {
+    var line = totals.lines[lineIndex];
+    items[lineIndex].taxBreakdown = {
+      gstPercent: line.gstPercent,
+      gross: line.gross,
+      discount: line.discount,
+      taxable: line.taxable,
+      tax: line.tax,
+      net: line.net
+    };
+  }
+
   var paymentMode = (body.paymentMode || 'cash').toLowerCase();
   var customerName = (body.customer || '').trim() || 'Walk-in';
   var customerId = body.customerId ? Number(body.customerId) : null;

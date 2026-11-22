@@ -3,6 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const invoice = require('../lib/invoice');
+const pricing = require('../lib/pricing');
+const config = require('../config');
 
 // In-memory fixtures copied from the ticket description; no database access.
 const order1002 = {
@@ -30,12 +32,13 @@ const order1004 = {
   total: 2194.5
 };
 
-test('invoice resolves each item GST rate from its HSN and discounts tax proportionally', function () {
+test('CURRENT BEHAVIOUR: invoice matches checkout GST and proportionally discounted tax', function () {
   const figures = invoice.computeInvoiceFigures(order1002);
 
   assert.equal(figures.subtotal, order1002.subtotal);
   assert.equal(figures.discount, order1002.discount);
   assert.deepEqual(figures.rows.map(function (row) { return row.gstPercent; }), [5, 5]);
+  assert.deepEqual(figures.rows.map(function (row) { return row.line; }), [640, 380]);
   assert.deepEqual(figures.rows.map(function (row) { return row.lineTax; }), [28.8, 17.1]);
   assert.equal(figures.tax, order1002.tax);
   assert.equal(figures.cgst, 22.95);
@@ -43,7 +46,7 @@ test('invoice resolves each item GST rate from its HSN and discounts tax proport
   assert.equal(figures.total, order1002.total);
 });
 
-test('invoice applies the configured maximum discount for SAVE10', function () {
+test('CURRENT BEHAVIOUR: invoice applies the configured maximum discount for SAVE10', function () {
   const figures = invoice.computeInvoiceFigures(order1004);
 
   assert.equal(figures.rows[0].gstPercent, 5);
@@ -52,7 +55,7 @@ test('invoice applies the configured maximum discount for SAVE10', function () {
   assert.equal(figures.total, order1004.total);
 });
 
-test('invoice uses the 12% HSN slab on non-coupon orders', function () {
+test('CURRENT BEHAVIOUR: invoice uses the 12% HSN slab on non-coupon orders', function () {
   const figures = invoice.computeInvoiceFigures({
     items: [{ name: 'A2 Gir Cow Ghee 500ml', hsn: '0405', price: 450, qty: 2 }],
     coupon: ''
@@ -63,9 +66,95 @@ test('invoice uses the 12% HSN slab on non-coupon orders', function () {
   assert.equal(figures.total, 1008);
 });
 
-test('rendered invoice omits a reconciliation warning when stored totals match checkout', function () {
+test('CURRENT BEHAVIOUR: rendered invoice omits a warning when stored totals match checkout', function () {
   const html = invoice.render(order1002);
 
   assert.match(html, /₹963\.90/);
   assert.doesNotMatch(html, /Accountant Reconciliation Notice/);
+});
+
+test('invoice preserves billed totals and GST after coupon configuration changes', function () {
+  const originalActive = config.coupons.SAVE10.active;
+  const checkedOut = pricing.computeTotals(order1002.items, order1002.coupon);
+  const billedOrder = Object.assign({}, order1002, {
+    subtotal: checkedOut.subtotal,
+    discount: checkedOut.discount,
+    tax: checkedOut.tax,
+    total: checkedOut.total
+  });
+
+  try {
+    config.coupons.SAVE10.active = false;
+
+    const invoiceFigures = invoice.computeInvoiceFigures(billedOrder);
+    const html = invoice.render(billedOrder);
+
+    assert.equal(billedOrder.total, 963.9);
+    assert.equal(invoiceFigures.discount, billedOrder.discount);
+    assert.equal(invoiceFigures.tax, billedOrder.tax);
+    assert.equal(invoiceFigures.cgst, 22.95);
+    assert.equal(invoiceFigures.sgst, 22.95);
+    assert.equal(invoiceFigures.total, billedOrder.total);
+    assert.deepEqual(invoiceFigures.rows.map(function (row) { return row.lineTax; }), [28.8, 17.1]);
+    assert.doesNotMatch(html, /Accountant Reconciliation Notice/);
+    assert.match(html, /₹963\.90/);
+  } finally {
+    config.coupons.SAVE10.active = originalActive;
+  }
+});
+
+test('invoice preserves stored line GST after HSN slab configuration changes', function () {
+  const checkedOut = pricing.computeTotals(order1002.items, order1002.coupon);
+  const billedOrder = Object.assign({}, order1002, {
+    items: order1002.items.map(function (item, index) {
+      const line = checkedOut.lines[index];
+      return Object.assign({}, item, {
+        taxBreakdown: {
+          gstPercent: line.gstPercent,
+          gross: line.gross,
+          discount: line.discount,
+          taxable: line.taxable,
+          tax: line.tax,
+          net: line.net
+        }
+      });
+    })
+  });
+  const originalRiceRate = config.tax.hsnSlabs['1006'];
+  const originalOilRate = config.tax.hsnSlabs['1512'];
+
+  try {
+    config.tax.hsnSlabs['1006'] = 12;
+    config.tax.hsnSlabs['1512'] = 18;
+
+    const figures = invoice.computeInvoiceFigures(billedOrder);
+
+    assert.deepEqual(figures.rows.map(function (row) { return row.gstPercent; }), [5, 5]);
+    assert.deepEqual(figures.rows.map(function (row) { return row.lineTax; }), [28.8, 17.1]);
+    assert.equal(pricing.round2(figures.rows.reduce(function (sum, row) { return sum + row.lineTax; }, 0)), billedOrder.tax);
+    assert.equal(figures.tax, billedOrder.tax);
+    assert.equal(figures.total, billedOrder.total);
+  } finally {
+    config.tax.hsnSlabs['1006'] = originalRiceRate;
+    config.tax.hsnSlabs['1512'] = originalOilRate;
+  }
+});
+
+test('legacy invoice line GST is reconciled to its stored order tax', function () {
+  const originalRiceRate = config.tax.hsnSlabs['1006'];
+  const originalOilRate = config.tax.hsnSlabs['1512'];
+
+  try {
+    config.tax.hsnSlabs['1006'] = 12;
+    config.tax.hsnSlabs['1512'] = 18;
+
+    const figures = invoice.computeInvoiceFigures(order1002);
+
+    assert.equal(pricing.round2(figures.rows.reduce(function (sum, row) { return sum + row.lineTax; }, 0)), order1002.tax);
+    assert.equal(figures.tax, order1002.tax);
+    assert.equal(figures.total, order1002.total);
+  } finally {
+    config.tax.hsnSlabs['1006'] = originalRiceRate;
+    config.tax.hsnSlabs['1512'] = originalOilRate;
+  }
 });
